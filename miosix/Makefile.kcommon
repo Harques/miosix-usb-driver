@@ -1,0 +1,98 @@
+##
+## Common code for building the Miosix kernel
+##
+
+## KPATH and CONFPATH should be forwarded by the parent Makefile
+ifeq ($(KPATH),)
+    $(info Error: KPATH not specified)
+    $(error Error)
+endif
+ifeq ($(CONFPATH),)
+    $(info Error: CONFPATH not specified)
+    $(error Error)
+endif
+
+include $(CONFPATH)/config/Makefile.inc
+
+## Includes the miosix base directory for C/C++
+## Always include CONFPATH first, as it overrides the config file location
+AFLAGS   ?= -qkernelspace $(AFLAGS_BASE) -c
+CFLAGS   ?= -qkernelspace $(CFLAGS_BASE)                                   \
+            -I$(CONFPATH) -I$(CONFPATH)/config/$(BOARD_INC) -I. -I$(KPATH) \
+            -I$(KPATH)/arch/common -I$(KPATH)/$(CPU_INC)                   \
+            -I$(KPATH)/$(ARCH_INC) -I$(KPATH)/$(BOARD_INC) $(INCLUDE_DIRS) \
+            -MMD -MP -c
+CXXFLAGS ?= -qkernelspace $(CXXFLAGS_BASE)                                 \
+            -I$(CONFPATH) -I$(CONFPATH)/config/$(BOARD_INC) -I. -I$(KPATH) \
+            -I$(KPATH)/arch/common -I$(KPATH)/$(CPU_INC)                   \
+            -I$(KPATH)/$(ARCH_INC) -I$(KPATH)/$(BOARD_INC) $(INCLUDE_DIRS) \
+            -MMD -MP -c
+LFLAGS   ?= -qkernelspace $(LFLAGS_BASE)
+STDLIBS  := -lmiosix -lstdc++ -lc -lm -lgcc -latomic
+LINK_LIBS ?= $(LIBS) -L$(KPATH) -Wl,--start-group $(STDLIBS) -Wl,--end-group
+TOOLS_DIR := $(KPATH)/_tools
+
+OBJ ?= $(addsuffix .o, $(basename $(SRC)))
+
+SUBDIRS := $(KPATH)
+# Not adding libsyscalls to SUBDIRS because it has to be built before
+LIBSYS  := $(KPATH)/libsyscalls
+
+# Starting from Miosix 3, we compile the kernel with the -qkernelspace option
+# that was not present in GCC patches before 15.2.0mp4.0, so when using an
+# earlier compiler the user gets a compiler error even before the compiler
+# version check in miosix_settings.h
+# To fix this, we check the compiler version also here in the build system
+ifneq ($(shell perl $(TOOLS_DIR)/compiler_check.pl $(CC)), 0)
+    $(info You are using a too old or unsupported compiler.)
+    $(info Get the latest one from https://miosix.org/wiki/index.php?title=Miosix_Toolchain)
+    $(error Error)
+endif
+
+.DEFAULT_GOAL := all
+
+image: main $(TOOLS_DIR)/filesystems/buildromfs
+	$(ECHO) "[FS  ] romfs.bin"
+	$(Q)./$(TOOLS_DIR)/filesystems/buildromfs romfs.bin \
+	  --from-directory $(ROMFS_DIR)
+	$(ECHO) "[IMG ] image.bin"
+	$(Q)perl $(TOOLS_DIR)/filesystems/mkimage.pl image.bin main.bin romfs.bin
+
+$(TOOLS_DIR)/filesystems/buildromfs:
+	$(ECHO) "[HOST] buildromfs"
+	$(Q)mkdir -p $(TOOLS_DIR)/filesystems/build
+	$(Q)cd $(TOOLS_DIR)/filesystems/build         \
+	  && cmake --log-level=ERROR .. && $(MAKE) -s
+
+all-recursive:
+	$(foreach i,$(SUBDIRS),$(MAKE) -C $(i)                                 \
+	  KPATH=$(shell perl $(TOOLS_DIR)/relpath.pl $(i) $(KPATH))            \
+	  CONFPATH=$(shell perl $(TOOLS_DIR)/relpath.pl $(i) $(CONFPATH))      \
+	  || exit 1;)
+
+clean-recursive:
+	$(foreach i,$(SUBDIRS),$(MAKE) -C $(i)                                 \
+	  KPATH=$(shell perl $(TOOLS_DIR)/relpath.pl $(i) $(KPATH))            \
+	  CONFPATH=$(shell perl $(TOOLS_DIR)/relpath.pl $(i) $(CONFPATH))      \
+	  clean || exit 1;)
+	$(Q)rm -f image.bin romfs.bin $(TOOLS_DIR)/filesystems/buildromfs
+	$(Q)rm -rf $(TOOLS_DIR)/filesystems/build
+
+program:
+	$(PROG)
+
+%.o : %.cpp
+	$(ECHO) "[CXX ] $<"
+	$(Q)$(CXX) $(CXXFLAGS) $< -o $@
+
+%.o : %.c
+	$(ECHO) "[CC  ] $<"
+	$(Q)$(CC)  $(CFLAGS) $< -o $@
+
+%.o: %.s
+	$(ECHO) "[AS  ] $<"
+	$(Q)$(CC)  $(AFLAGS) $< -o $@
+
+%.o: %.S
+	$(ECHO) "[AS  ] $<"
+	$(Q)$(CC)  $(AFLAGS) $< -o $@

@@ -1,0 +1,366 @@
+/***************************************************************************
+ *   Copyright (C) 2010-2025 by Terraneo Federico                          *
+ *                                                                         *
+ *   This program is free software; you can redistribute it and/or modify  *
+ *   it under the terms of the GNU General Public License as published by  *
+ *   the Free Software Foundation; either version 2 of the License, or     *
+ *   (at your option) any later version.                                   *
+ *                                                                         *
+ *   This program is distributed in the hope that it will be useful,       *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+ *   GNU General Public License for more details.                          *
+ *                                                                         *
+ *   As a special exception, if other files instantiate templates or use   *
+ *   macros or inline functions from this file, or you compile this file   *
+ *   and link it with other works to produce a work based on this file,    *
+ *   this file does not by itself cause the resulting work to be covered   *
+ *   by the GNU General Public License. However the source code for this   *
+ *   file must still be made available in accordance with the GNU General  *
+ *   Public License. This exception does not invalidate any other reasons  *
+ *   why a work based on this file might be covered by the GNU General     *
+ *   Public License.                                                       *
+ *                                                                         *
+ *   You should have received a copy of the GNU General Public License     *
+ *   along with this program; if not, see <http://www.gnu.org/licenses/>   *
+ ***************************************************************************/
+
+#include "priority_scheduler.h"
+#include "kernel/scheduler/scheduler.h"
+#include "kernel/error.h"
+#include "kernel/process.h"
+#include "interfaces_private/cpu.h"
+#include "interfaces_private/smp.h"
+#include "kernel/cpu_time_counter.h"
+#include <limits>
+
+using namespace std;
+
+#ifdef SCHED_TYPE_PRIORITY
+namespace miosix {
+
+//These are defined in thread.cpp
+extern volatile Thread *runningThreads[CPU_NUM_CORES];
+
+//
+// class PriorityScheduler
+//
+
+bool PriorityScheduler::IRQaddThread(Thread *thread,
+        PrioritySchedulerPriority priority)
+{
+    thread->schedData.priority=priority;
+    //Priority and savedPriority must be the same except when locking a mutex
+    //with priority inheritance. A newly created thread isn't yet locking mutex
+    thread->savedPriority=priority;
+    #ifdef WITH_PROCESSES
+    // Check isReady() as processes are initially created in not ready state
+    if(thread->flags.isReady()==false) notReadyThreads.push_front(thread);
+    else
+    #endif //WITH_PROCESSES
+    readyThreads[priority.get()].push_back(thread);
+    return true;
+}
+
+bool PriorityScheduler::IRQexists(Thread *thread)
+{
+    for(int i=0;i<CPU_NUM_CORES;i++)
+        if(runningThreads[i]==thread) return !thread->flags.isDeleted();
+    for(int i=NUM_PRIORITIES-1;i>=0;i--)
+        for(auto t : readyThreads[i]) if(t==thread) return true;
+    for(auto t : notReadyThreads) if(t==thread) return !thread->flags.isDeleted();
+    return false;
+}
+
+void PriorityScheduler::removeDeadThreads()
+{
+    for(;;)
+    {
+        Thread *t;
+        {
+            FastGlobalIrqLock dLock;
+            if(notReadyThreads.empty()) return;
+            t=notReadyThreads.back();
+            // All deleted threads are at the bottom of the list, so the first
+            // not deleted we found means there are no more
+            if(t->flags.isDeleted()==false) return;
+            notReadyThreads.pop_back();
+        }
+        //Optimization: don't keep the lock while thread is being deleted
+        void *base=t->watermark;
+        t->~Thread();//Call destructor manually because of placement new
+        free(base);  //Delete ALL thread memory
+    }
+}
+
+void PriorityScheduler::IRQsetPriority(Thread *thread,
+        PrioritySchedulerPriority newPriority)
+{
+    if(extraChecks==ExtraChecks::Kernel)
+        if(thread->flags.isZombie()) errorHandler(Error::UNEXPECTED);
+
+    // If thread is running it is not in any list, only change priority value
+    for(int i=0;i<CPU_NUM_CORES;i++)
+    {
+        if(thread==runningThreads[i])
+        {
+            thread->schedData.priority=newPriority;
+            return;
+        }
+    }
+    // If thread is not ready it will remain in the notReadyThreads list,
+    // only change priority value
+    if(thread->flags.isReady()==false)
+    {
+        thread->schedData.priority=newPriority;
+        return;
+    }
+    // Ready threads need to change list, remove the thread from its old list
+    readyThreads[thread->schedData.priority.get()].removeFast(thread);
+    // Set priority to the new value
+    thread->schedData.priority=newPriority;
+    // Last insert the thread in the new list
+    readyThreads[newPriority.get()].push_back(thread);
+}
+
+void PriorityScheduler::IRQsetIdleThread(int whichCore, Thread *idleThread)
+{
+    idleThread->schedData.priority=-1;
+    idleThread->savedPriority=-1;
+    idle[whichCore]=idleThread;
+}
+
+void PriorityScheduler::IRQwokenThread(Thread* thread)
+{
+    // NOTE: this check is necessary as there is the corner case of a thread
+    // that has just set itself to sleeping/waiting but it gets woken up before
+    // the scheduler has a chance to run. Thus it is both awakened and running,
+    // and we must not call notReadyThreads.removeFast(thread) if it's not in
+    // that list as it causes undefined behavior
+    for(int i=0;i<CPU_NUM_CORES;i++) if(runningThreads[i]==thread) return;
+    notReadyThreads.removeFast(thread);
+    readyThreads[thread->schedData.priority.get()].push_back(thread);
+}
+
+/*
+ * The scheduler in Miosix 3.0 runs in its dedicated interrupt, which on ARM is
+ * called PendSV. The scheduler has no input parameter that code invoking it
+ * through IRQinvokeScheduler() or IRQinvokeSchedulerOnCore() can pass to it.
+ * Rather, when it is run, it follows a "must preempt" policy. Since it has been
+ * called, it assumes the currently running thread must be unconditionally
+ * descheduled. If the thread is still ready, it is placed at the end of the
+ * ready queue for its priority level. Thus, parts of the kernel that invoke the
+ * scheduler must be mindful not to invoke it unnecessarily (that includes not
+ * invoking it unnecessarily on another core in multi-core architectures), since
+ * doing so causes the currently running thread to be preempted for no reason.
+ * Excluding the cases where a thread blocks for some reason, where obviously
+ * the scheduler must be invoked on the current core, the more complex case of
+ * a thread waking (which could in theory be scheduled on any core) is handled
+ * through the Thread::IRQconsiderRescheduling() function that decides based on
+ * the woken thread priority, the priority of the threads currently running on
+ * each core and optionally the thread's affinity mask on which core should the
+ * scheduler be invoked, if at all.
+ * The last detail that needs to be considered is how to handle multiple threads
+ * waking at the same time. Example code paths include multiple threads sleeping
+ * with the same wakeup time and a thread terminating while another thread is
+ * waiting on join (see Thread::threadLauncher). In such a case there's no easy
+ * way to invoke the scheduler on exactly all the cores needed without
+ * replicating the entire scheduling algorithm in IRQconsiderRescheduling(), and
+ * with the added issue that there could always be a race condition between when
+ * IRQconsiderRescheduling() is run and when the scheduler runs changing the
+ * picture. We deal with this issue by IRQconsiderRescheduling() being stateless
+ * and always make decisions as if a single thread needs to be scheduled.
+ * This may result in the same core being selected for multiple high priority
+ * threads that could instead be scheduled concurrently on multiple cores.
+ * In the scheduler itself, after we schedule a thread, we evaluate the state of
+ * the other cores and we let the scheduler on one core invoke the scheduler
+ * on another core if the invariant that "no thread is ready while a lower
+ * priority thread is running" is broken.
+ */
+
+#ifdef WITH_SMP
+void PriorityScheduler::IRQrunScheduler(unsigned char coreId)
+{
+#else //WITH_SMP
+void PriorityScheduler::IRQrunScheduler()
+{
+    constexpr unsigned char coreId=0;
+#endif //WITH_SMP
+    //If the previously running thread is not idle, we need to put it in a list
+    Thread *prev=const_cast<Thread*>(runningThreads[coreId]);
+    if(prev!=idle[coreId])
+    {
+        // NOTE: notReadyThreads must be pushed back if deleted, front if not
+        // while if ready always back (round-robin)
+        if(prev->flags.isZombie()) notReadyThreads.push_back(prev);
+        else if(prev->flags.isReady()==false) notReadyThreads.push_front(prev);
+        else readyThreads[prev->schedData.priority.get()].push_back(prev);
+    }
+    #ifdef WITH_SMP
+    // Cache the priority of all running threads in an array. Note that we're
+    // interested in the priorities after the scheduler is run but we still
+    // don't what the priority will be on the current core as we haven't
+    // done the scheduling yet. However, since this variable is used to decide
+    // if we need to invoke the scheduler on another core we just lie and set
+    // the priority of the current core to the maximum value so as to always
+    // exclude the current core
+    signed char runningPrio[CPU_NUM_CORES];
+    for(int c=0;c<CPU_NUM_CORES;c++)
+        runningPrio[c]=const_cast<Thread*>(runningThreads[c])->schedData.priority.get();
+    runningPrio[coreId]=NUM_PRIORITIES-1;
+    #ifdef WITH_THREAD_AFFINITY
+    int scheduleOnOtherCore=-1;
+    #endif //WITH_THREAD_AFFINITY
+    #endif //WITH_SMP
+    for(int prio=NUM_PRIORITIES-1;prio>=0;prio--)
+    {
+        #if defined(WITH_THREAD_AFFINITY) && defined(WITH_SMP)
+        // If the kernel is compiled with affinity support we can't just pick
+        // the first thread in the ready list, we need to check the affinity
+        Thread *t=nullptr;
+        for(auto it=begin(readyThreads[prio]);it!=end(readyThreads[prio]);++it)
+        {
+            auto affinity=(*it)->affinity;
+            if(affinity & (1<<coreId))
+            {
+                // Found highest priority thread whose affinity is compatible
+                // with this core. That's the one we'll schedule
+                t=*it;
+                readyThreads[prio].erase(it);
+                break;
+            } else {
+                // Found thread that can't run on this core due to affinity.
+                // On the cores it can run it may however preempt the currently
+                // running thread. We only need to find one such thread though
+                // as if there are more, they will be discovered when the
+                // scheduler is called on the other core (distributed algorithm)
+                if(scheduleOnOtherCore>=0) continue;
+                for(int c=0;c<CPU_NUM_CORES;c++)
+                {
+                    if((affinity & (1<<c))==0) continue;
+                    if(prio<runningPrio[c]) continue;
+                    scheduleOnOtherCore=c;
+                    break;
+                }
+            }
+        }
+        if(t==nullptr) continue;
+        #else //defined(WITH_THREAD_AFFINITY) && defined(WITH_SMP)
+        if(readyThreads[prio].empty()) continue;
+        Thread *t=readyThreads[prio].front();
+        readyThreads[prio].pop_front(); //Remove selected thread from list
+        #endif //defined(WITH_THREAD_AFFINITY) && defined(WITH_SMP)
+        runningThreads[coreId]=t;
+        #ifdef WITH_PROCESSES
+        if(t->flags.isInUserspace()==false)
+        {
+            ctxsave[coreId]=t->ctxsave;
+            MPUConfiguration::IRQdisable();
+        } else {
+            ctxsave[coreId]=t->userCtxsave;
+            //A kernel thread is never in userspace, so the cast is safe
+            static_cast<Process*>(t->proc)->mpu.IRQenable();
+        }
+        #else //WITH_PROCESSES
+        ctxsave[coreId]=t->ctxsave;
+        #endif //WITH_PROCESSES
+        #ifndef WITH_CPU_TIME_COUNTER
+        Scheduler::IRQcomputePreemption(coreId,MAX_TIME_SLICE);
+        #else //WITH_CPU_TIME_COUNTER
+        auto now=Scheduler::IRQcomputePreemption(coreId,MAX_TIME_SLICE);
+        CPUTimeCounter::IRQprofileContextSwitch(prev,t,now,coreId);
+        #endif //WITH_CPU_TIME_COUNTER
+        #ifdef WITH_SMP
+        // In case multiple threads are woken at the same time, we may have to
+        // schedule more than one higher priority thread than currently running.
+        // When this happens, we need to call the scheduler again on more than
+        // one core. Additionally, if compiling with thread affinity we may have
+        // already found that we need to invoke the scheduler on another core
+        // because a higher priority thread wasn't selected on this core due to
+        // incompatible affinity. In this case skip this algorithm as we don't
+        // need to solve the schedule for all cores, just figuring out that
+        // it's wrong one core is enough. Then the invoked scheduler on that
+        // core will complete the job and figure out if there is the need to
+        // reschedule on yet another core
+        #ifdef WITH_THREAD_AFFINITY
+        // With affinity, see if we find a compatible thread with higher priority
+        if(scheduleOnOtherCore<0)
+        {
+            signed char minRunningPriority=runningPrio[0];
+            for(int c=1;c<CPU_NUM_CORES;c++)
+                minRunningPriority=min(minRunningPriority,runningPrio[c]);
+            // This is a loop in a loop with the same variable to continue from
+            // where we left, but we'll never go back to the outer loop
+            for(;prio>minRunningPriority;prio--)
+            {
+                for(auto it=begin(readyThreads[prio]);it!=end(readyThreads[prio]);++it)
+                {
+                    auto affinity=(*it)->affinity;
+                    for(int c=0;c<CPU_NUM_CORES;c++)
+                    {
+                        if((affinity & (1<<c))==0) continue;
+                        if(prio<runningPrio[c]) continue;
+                        IRQinvokeSchedulerOnCore(c);
+                        goto found;
+                    }
+                }
+            }
+            found:;
+        }
+        #else //WITH_THREAD_AFFINITY
+        // No affinity, just knowing a ready thread exists with higher periority
+        // is enough, it can surely be running on any core
+        signed char minRunningPriority=runningPrio[0];
+        int coreRunningMinPriorityThread=0;
+        for(int c=1;c<CPU_NUM_CORES;c++)
+        {
+            if(runningPrio[c]<minRunningPriority)
+            {
+                minRunningPriority=runningPrio[c];
+                coreRunningMinPriorityThread=c;
+            }
+        }
+        // This is a loop in a loop with the same variable to continue from
+        // where we left, but we'll never go back to the outer loop
+        for(;prio>minRunningPriority;prio--)
+        {
+            if(readyThreads[prio].empty()) continue;
+            IRQinvokeSchedulerOnCore(coreRunningMinPriorityThread);
+            break;
+        }
+        #endif //WITH_THREAD_AFFINITY
+        #endif //WITH_SMP
+        return;
+    }
+    #if defined(WITH_THREAD_AFFINITY) && defined(WITH_SMP)
+    // Only if thread affinity support is enabled we may end up in the situation
+    // where we are about to schedule the idle thread on one core and at the
+    // same time we need to call the scheduler on another core
+    if(scheduleOnOtherCore>=0) IRQinvokeSchedulerOnCore(scheduleOnOtherCore);
+    #endif //defined(WITH_THREAD_AFFINITY) && defined(WITH_SMP)
+    //No thread found, run the idle thread
+    runningThreads[coreId]=idle[coreId];
+    ctxsave[coreId]=idle[coreId]->ctxsave;
+    #ifdef WITH_PROCESSES
+    MPUConfiguration::IRQdisable();
+    #endif //WITH_PROCESSES
+    #ifndef WITH_CPU_TIME_COUNTER
+    Scheduler::IRQcomputePreemption(coreId,0);
+    #else //WITH_CPU_TIME_COUNTER
+    auto now=Scheduler::IRQcomputePreemption(coreId,0);
+    CPUTimeCounter::IRQprofileContextSwitch(prev,idle[coreId],now,coreId);
+    #endif //WITH_CPU_TIME_COUNTER
+}
+
+IntrusiveList<Thread> PriorityScheduler::readyThreads[NUM_PRIORITIES];
+IntrusiveList<Thread> PriorityScheduler::notReadyThreads;
+Thread *PriorityScheduler::idle[CPU_NUM_CORES]={nullptr};
+
+#ifdef OS_TIMER_MODEL_UNIFIED
+template<typename T>
+long long basic_scheduler<T>::nextPreemptionWakeupCore=numeric_limits<long long>::max();
+#endif //OS_TIMER_MODEL_UNIFIED
+
+} //namespace miosix
+
+#endif //SCHED_TYPE_PRIORITY

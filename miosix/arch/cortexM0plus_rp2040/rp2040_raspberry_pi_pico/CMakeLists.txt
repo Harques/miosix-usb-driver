@@ -1,0 +1,80 @@
+# Copyright (C) 2024 by Skyward
+#
+# This program is free software; you can redistribute it and/or
+# it under the terms of the GNU General Public License as published
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# As a special exception, if other files instantiate templates or use
+# macros or inline functions from this file, or you compile this file
+# and link it with other works to produce a work based on this file,
+# this file does not by itself cause the resulting work to be covered
+# by the GNU General Public License. However the source code for this
+# file must still be made available in accordance with the GNU
+# Public License. This exception does not invalidate any other
+# why a work based on this file might be covered by the GNU General
+# Public License.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <http://www.gnu.org/licenses/>
+
+# Directory with header files for this board
+set(MIOSIX_BOARD_INC ${MIOSIX_KPATH}/arch/${MIOSIX_ARCH_NAME}/${MIOSIX_OPT_BOARD})
+
+# The user can set a custom path for board_settings.h
+set(MIOSIX_CUSTOM_BOARD_SETTINGS_INC "" CACHE PATH "Include directory for custom board_settings.h")
+mark_as_advanced(MIOSIX_CUSTOM_BOARD_SETTINGS_INC)
+if(MIOSIX_CUSTOM_BOARD_SETTINGS_INC)
+    set(MIOSIX_BOARD_SETTINGS_INC ${MIOSIX_CUSTOM_BOARD_SETTINGS_INC})
+    message(NOTICE "You have set a custom path for board_settings.h")
+else()
+    set(MIOSIX_BOARD_SETTINGS_INC ${MIOSIX_CONFIG_PATH}/arch/${MIOSIX_ARCH_NAME}/${MIOSIX_OPT_BOARD})
+endif()
+
+# Linker script options:
+# 1) Code in FLASH, stack + heap in internal RAM (file *_rom.ld)
+# 2) Code + stack + heap in internal RAM (file *_ram.ld)
+# 3) Same as 1) but space has been reserved for a process pool, allowing
+#    to configure the kernel with "#define WITH_PROCESSES"
+set(MIOSIX_LINKER_SCRIPT_LIST
+    rp2040_2M+264k_rom.ld
+    rp2040_2M+264k_processes.ld
+)
+if(NOT MIOSIX_LINKER_SCRIPT IN_LIST MIOSIX_LINKER_SCRIPT_LIST)
+    # If there is no cached value, or the cached value is not in the list, set a default value
+    set(MIOSIX_LINKER_SCRIPT rp2040_2M+264k_rom.ld CACHE STRING "Linker script" FORCE)
+endif()
+set_property(CACHE MIOSIX_LINKER_SCRIPT PROPERTY STRINGS ${MIOSIX_LINKER_SCRIPT_LIST})
+
+# Select architecture specific files
+set(MIOSIX_ARCH_SRC
+    ${MIOSIX_ARCH_INC}/rp2040_boot.cpp
+    ${MIOSIX_BOARD_INC}/interfaces-impl/bsp.cpp
+)
+
+# Board variant for selecting either the "plain" Pico or Pico W
+set(MIOSIX_BOARD_VARIANT_LIST
+    BOARD_VARIANT_PICO
+    BOARD_VARIANT_PICO_W
+)
+if(NOT MIOSIX_BOARD_VARIANT IN_LIST MIOSIX_BOARD_VARIANT_LIST)
+    # If there is no cached value, or the cached value is not in the list, set a default value
+    set(MIOSIX_BOARD_VARIANT BOARD_VARIANT_PICO_W CACHE STRING "Board variant" FORCE)
+endif()
+set_property(CACHE MIOSIX_BOARD_VARIANT PROPERTY STRINGS ${MIOSIX_BOARD_VARIANT_LIST})
+
+# Add a #define to allow querying board name
+list(APPEND MIOSIX_C_FLAGS -DBOARD_RP2040_RASPBERRY_PI_PICO)
+list(APPEND MIOSIX_CXX_FLAGS -DBOARD_RP2040_RASPBERRY_PI_PICO)
+
+# Specify a custom flash command
+# This is the program that is invoked when the program-<target_name> target is
+# built. Use <binary> or <hex> as placeolders, they will be replaced by the
+# build systems with the binary or hex file path repectively.
+# If a command is not specified, the build system will fallback to st-flash
+set(PROGRAM_CMDLINE picotool load -x <binary>)
