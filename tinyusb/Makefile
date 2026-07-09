@@ -4,7 +4,7 @@
 ##
 
 ## KPATH and CONFPATH are forwarded by the parent Makefile
-MAKEFILE_VERSION := 1.16
+MAKEFILE_VERSION := 3.01
 include $(KPATH)/Makefile.kcommon
 
 ## List of all tinyusb source files (both .c and .cpp)
@@ -24,20 +24,16 @@ SRC := \
     tinyusb/src/tusb.c \
     tusb_os_custom.cpp
 
-INCLUDE_DIRS := -I. -I./cmsis_stubs -I./tinyusb/src -I$(CONFPATH)/config
+INCLUDE_DIRS := -I. -I./cmsis_stubs -I./tinyusb/src
 
 CFLAGS   += -fno-strict-aliasing -Wno-address-of-packed-member
 CXXFLAGS += -fno-strict-aliasing -Wno-address-of-packed-member
 
-# Use > as recipe prefix so recipe lines are unambiguously separated from
-# variable/rule lines, avoiding the "missing separator" error on Windows.
-.RECIPEPREFIX := >
-
 all: $(OBJ)
->$(ECHO) "[AR  ] libtinyusb.a"
->$(Q)$(AR) rcs libtinyusb.a $(OBJ)
+	$(ECHO) "[AR  ] libtinyusb.a"
+	$(Q)$(AR) rcs libtinyusb.a $(OBJ)
 
 clean:
->-rm -f $(OBJ) $(OBJ:.o=.d) libtinyusb.a
+	-rm -f $(OBJ) $(OBJ:.o=.d) libtinyusb.a
 
 -include $(OBJ:.o=.d)

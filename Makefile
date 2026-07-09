@@ -3,7 +3,7 @@
 ##
 
 ## Path to the Miosix kernel root (miosix-kernel/miosix)
-KPATH := ../../miosix
+KPATH := miosix
 
 ## Path to the Miosix config root, containing:
 ##  - config/Makefile.inc
